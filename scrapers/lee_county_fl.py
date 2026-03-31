@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 # NOTE: Verify PDF link selector against live page before production use.
+#
+# The leeclerk.org site is served behind Akamai CDN which blocks automated
+# requests with a 403 Access Denied. If the page returns a non-200 status,
+# fetch() logs a warning and returns an empty list rather than crashing the
+# pipeline. When access is restored, the PDF table structure should be
+# verified: current column assumptions are owner[0], address[1], case[2],
+# date[3], amount[4].
 
+import io
+import logging
 import re
 from datetime import datetime, timezone
 
@@ -23,6 +32,8 @@ _HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     )
 }
+
+logger = logging.getLogger(__name__)
 
 _DATE_FORMATS = ["%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"]
 
@@ -49,7 +60,15 @@ class LeeCountyFLScraper(BaseScraper):
     async def fetch(self) -> list[SurplusRecord]:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             page_resp = await client.get(_BASE_URL, headers=_HEADERS)
-            page_resp.raise_for_status()
+
+            if page_resp.status_code != 200:
+                logger.warning(
+                    "[lee-county-fl] Base page returned HTTP %d — "
+                    "site may be blocking automated requests (Akamai CDN). "
+                    "Returning empty result set.",
+                    page_resp.status_code,
+                )
+                return []
 
             soup = BeautifulSoup(page_resp.text, "html.parser")
             pdf_link = None
@@ -60,6 +79,7 @@ class LeeCountyFLScraper(BaseScraper):
                     break
 
             if pdf_link is None:
+                logger.warning("[lee-county-fl] No surplus PDF link found on page.")
                 return []
 
             if not pdf_link.startswith("http"):
@@ -67,10 +87,16 @@ class LeeCountyFLScraper(BaseScraper):
                 pdf_link = base + pdf_link if pdf_link.startswith("/") else base + "/" + pdf_link
 
             pdf_resp = await client.get(pdf_link, headers=_HEADERS)
-            pdf_resp.raise_for_status()
+            if pdf_resp.status_code != 200:
+                logger.warning(
+                    "[lee-county-fl] PDF download returned HTTP %d for %s",
+                    pdf_resp.status_code,
+                    pdf_link,
+                )
+                return []
+
             pdf_bytes = pdf_resp.content
 
-        import io
         records: list[SurplusRecord] = []
 
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:

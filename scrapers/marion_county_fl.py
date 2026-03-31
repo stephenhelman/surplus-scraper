@@ -1,6 +1,15 @@
 from __future__ import annotations
 
 # NOTE: Verify PDF link selector against live page before production use.
+#
+# The Marion County "Tax Deeds Surplus Funds" PDF uses plain text layout —
+# pdfplumber finds 0 tables. All parsing uses extract_text() line-by-line.
+#
+# Actual column order (verified 2026-03-30):
+#   Sale number | Sale date (YYYY-MM-DD) | Tax number | Parcel number | Current balance
+#
+# Owner name is NOT present in this PDF; owner_name is left blank for
+# skip-trace enrichment to populate later.
 
 import io
 import re
@@ -26,12 +35,18 @@ _HEADERS = {
     )
 }
 
-_DATE_FORMATS = ["%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d"]
+# Lines that are page headers, not data
+_SKIP_PREFIXES = ("tax deeds", "report run", "sale number")
+
+
+def _is_header_line(line: str) -> bool:
+    low = line.lower().strip()
+    return not low or any(low.startswith(p) for p in _SKIP_PREFIXES)
 
 
 def _parse_date(date_str: str) -> datetime:
     date_str = date_str.strip()
-    for fmt in _DATE_FORMATS:
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
             return datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
@@ -54,10 +69,18 @@ class MarionCountyFLScraper(BaseScraper):
             page_resp.raise_for_status()
 
             soup = BeautifulSoup(page_resp.text, "html.parser")
+
+            # Require BOTH "surplus" and "funds" in the link text or href to
+            # avoid matching the "Tax Deeds Surplus Claim Form" PDF that appears
+            # earlier on the same page.
             pdf_link = None
             for tag in soup.find_all("a", href=True):
                 href = tag["href"]
-                if "surplus" in href.lower() or "surplus" in tag.get_text(strip=True).lower():
+                text = tag.get_text(strip=True).lower()
+                href_low = href.lower()
+                if ("surplus" in text and "funds" in text) or (
+                    "surplus" in href_low and "funds" in href_low
+                ):
                     pdf_link = href
                     break
 
@@ -76,43 +99,40 @@ class MarionCountyFLScraper(BaseScraper):
 
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
-                tables = page.extract_tables()
-                for table in tables:
-                    for i, row in enumerate(table):
-                        if i == 0:
-                            continue
-                        if not row or len(row) < 5:
-                            continue
-                        try:
-                            owner = (row[0] or "").strip()
-                            address = (row[1] or "").strip()
-                            case = (row[2] or "").strip()
-                            date_str = (row[3] or "").strip()
-                            amount_str = (row[4] or "").strip()
+                text = page.extract_text()
+                if not text:
+                    continue
+                for line in text.splitlines():
+                    if _is_header_line(line):
+                        continue
+                    parts = line.split()
+                    # Expected: sale_num  sale_date  tax_num  parcel_num  amount
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        case = parts[0]
+                        sale_date = _parse_date(parts[1])
+                        # parts[2] is tax number — not used
+                        parcel = parts[3]
+                        amount = _parse_amount(parts[4])
+                    except (ValueError, IndexError):
+                        continue
 
-                            if not owner or not amount_str:
-                                continue
+                    if amount < 5000:
+                        continue
+                    if not self.is_within_window(sale_date):
+                        continue
 
-                            sale_date = _parse_date(date_str)
-                            amount = _parse_amount(amount_str)
-                        except (ValueError, IndexError):
-                            continue
-
-                        if amount < 5000:
-                            continue
-                        if not self.is_within_window(sale_date):
-                            continue
-
-                        records.append(
-                            SurplusRecord(
-                                owner_name=owner,
-                                property_address=address,
-                                case_number=case,
-                                surplus_amount=amount,
-                                sale_date=sale_date,
-                                county=self.county_label,
-                                raw_source=pdf_link,
-                            )
+                    records.append(
+                        SurplusRecord(
+                            owner_name="",
+                            property_address=parcel,
+                            case_number=case,
+                            surplus_amount=amount,
+                            sale_date=sale_date,
+                            county=self.county_label,
+                            raw_source=pdf_link,
                         )
+                    )
 
         return records
