@@ -32,6 +32,12 @@ from enrichment.skip_trace import (
 SCRAPER_SECRET = os.getenv("SCRAPER_SECRET", "")
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 
+if not SCRAPER_SECRET:
+    raise RuntimeError(
+        "SCRAPER_SECRET env var is not set — "
+        "cannot authenticate callbacks"
+    )
+
 app = FastAPI(title="Surplus Scraper Service")
 
 app.add_middleware(
@@ -86,6 +92,20 @@ async def run_county(
     return {"status": "started", "county": county}
 
 
+def _callback_headers() -> dict:
+    return {"x-internal-secret": SCRAPER_SECRET}
+
+
+async def _post_callback(client: httpx.AsyncClient, callback_url: str, payload: dict) -> None:
+    print(f"[callback] Sending to: {callback_url}")
+    print(f"[callback] Secret present: {bool(SCRAPER_SECRET)}")
+    print(f"[callback] Secret preview: {SCRAPER_SECRET[:6] if SCRAPER_SECRET else 'MISSING'}...")
+    response = await client.post(callback_url, json=payload, headers=_callback_headers())
+    print(f"[callback] Response status: {response.status_code}")
+    if response.status_code != 200:
+        print(f"[callback] Response body: {response.text}")
+
+
 async def run_pipeline(county: str, callback_url: str) -> None:
     async with httpx.AsyncClient(timeout=60) as client:
         try:
@@ -100,13 +120,10 @@ async def run_pipeline(county: str, callback_url: str) -> None:
 
             if not clean:
                 logger.warning("[%s] No records found after scraping", county)
-                await client.post(
-                    callback_url,
-                    json={
-                        "status": "error",
-                        "error": f"No surplus records found for {county}.",
-                    },
-                )
+                await _post_callback(client, callback_url, {
+                    "status": "error",
+                    "error": f"No surplus records found for {county}.",
+                })
                 return
 
             # Phase 2 — pre-enrichment callback
@@ -128,16 +145,13 @@ async def run_pipeline(county: str, callback_url: str) -> None:
                 county, enrichment_on, len(eligible_preview), capped_count, est_cost,
             )
 
-            await client.post(
-                callback_url,
-                json={
-                    "status": "enriching",
-                    "totalRecords": len(clean),
-                    "eligibleCount": capped_count_to_report,
-                    "estimatedCost": est_cost_to_report,
-                    "skipTraceEnabled": enrichment_on,
-                },
-            )
+            await _post_callback(client, callback_url, {
+                "status": "enriching",
+                "totalRecords": len(clean),
+                "eligibleCount": capped_count_to_report,
+                "estimatedCost": est_cost_to_report,
+                "skipTraceEnabled": enrichment_on,
+            })
 
             # Phase 3 — enrich
             logger.info("[%s] Phase 3: enriching %d records", county, len(clean))
@@ -149,25 +163,22 @@ async def run_pipeline(county: str, callback_url: str) -> None:
 
             # Phase 4 — done callback
             logger.info("[%s] Phase 4: sending done callback", county)
-            await client.post(
-                callback_url,
-                json={
-                    "status": "done",
-                    "totalRecords": len(leads),
-                    "eligibleCount": eligible_count,
-                    "actualCost": actual_cost,
-                    "skipTraceEnabled": enrichment_on,
-                    "leads": leads,
-                },
-            )
+            await _post_callback(client, callback_url, {
+                "status": "done",
+                "totalRecords": len(leads),
+                "eligibleCount": eligible_count,
+                "actualCost": actual_cost,
+                "skipTraceEnabled": enrichment_on,
+                "leads": leads,
+            })
             logger.info("[%s] Pipeline complete", county)
 
         except Exception as exc:
             logger.exception("[%s] Pipeline error: %s", county, exc)
             try:
-                await client.post(
-                    callback_url,
-                    json={"status": "error", "error": str(exc)},
-                )
+                await _post_callback(client, callback_url, {
+                    "status": "error",
+                    "error": str(exc),
+                })
             except Exception:
                 pass
