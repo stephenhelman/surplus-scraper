@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+import httpx
+
+from scrapers.registry import REGISTRY, get_scraper
+from enrichment.normalizer import normalize
+from enrichment.skip_trace import (
+    COST_PER_RECORD,
+    MAX_ENRICH_PER_RUN,
+    SKIP_TRACE_MIN_SURPLUS,
+    enrich_records,
+    skip_trace_enabled,
+)
+
+SCRAPER_SECRET = os.getenv("SCRAPER_SECRET", "")
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
+
+app = FastAPI(title="Surplus Scraper Service")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[ALLOWED_ORIGIN] if ALLOWED_ORIGIN != "*" else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class RunRequest(BaseModel):
+    callbackUrl: str
+
+
+@app.get("/health")
+async def health():
+    batchdata_key = os.getenv("BATCHDATA_API_KEY", "")
+    skip_trace_min = float(os.getenv("SKIP_TRACE_MIN_SURPLUS", "15000"))
+    max_enrich = int(os.getenv("MAX_ENRICH_PER_RUN", "100"))
+    cost_per = float(os.getenv("COST_PER_RECORD", "0.35"))
+
+    return {
+        "status": "ok",
+        "supportedCounties": list(REGISTRY.keys()),
+        "config": {
+            "skipTraceMinSurplus": skip_trace_min,
+            "maxEnrichPerRun": max_enrich,
+            "costPerRecord": cost_per,
+            "skipTraceEnabled": bool(batchdata_key),
+        },
+    }
+
+
+@app.post("/run/{county}")
+async def run_county(
+    county: str,
+    body: RunRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    secret = request.headers.get("x-internal-secret", "")
+    expected = os.getenv("SCRAPER_SECRET", "")
+    if not secret or secret != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if county not in REGISTRY:
+        raise HTTPException(status_code=404, detail=f"County {county!r} not found")
+
+    background_tasks.add_task(run_pipeline, county, body.callbackUrl)
+    return {"status": "started", "county": county}
+
+
+async def run_pipeline(county: str, callback_url: str) -> None:
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            # Phase 1 — scrape + normalize
+            scraper = get_scraper(county)
+            raw = await scraper.fetch()
+            clean = normalize(raw)
+
+            # Phase 2 — pre-enrichment callback
+            min_surplus = float(os.getenv("SKIP_TRACE_MIN_SURPLUS", "15000"))
+            max_enrich = int(os.getenv("MAX_ENRICH_PER_RUN", "100"))
+            cost_per = float(os.getenv("COST_PER_RECORD", "0.35"))
+
+            eligible_preview = [r for r in clean if r.surplus_amount >= min_surplus]
+            capped_count = min(len(eligible_preview), max_enrich)
+            est_cost = round(capped_count * cost_per, 2)
+
+            enrichment_on = skip_trace_enabled()
+            capped_count_to_report = capped_count if enrichment_on else 0
+            est_cost_to_report = est_cost if enrichment_on else 0.0
+
+            await client.post(
+                callback_url,
+                json={
+                    "status": "enriching",
+                    "totalRecords": len(clean),
+                    "eligibleCount": capped_count_to_report,
+                    "estimatedCost": est_cost_to_report,
+                    "skipTraceEnabled": enrichment_on,
+                },
+            )
+
+            # Phase 3 — enrich
+            leads, eligible_count, actual_cost = await enrich_records(clean)
+
+            # Phase 4 — done callback
+            await client.post(
+                callback_url,
+                json={
+                    "status": "done",
+                    "totalRecords": len(leads),
+                    "eligibleCount": eligible_count,
+                    "actualCost": actual_cost,
+                    "skipTraceEnabled": enrichment_on,
+                    "leads": leads,
+                },
+            )
+
+        except Exception as exc:
+            try:
+                await client.post(
+                    callback_url,
+                    json={"status": "error", "error": str(exc)},
+                )
+            except Exception:
+                pass
