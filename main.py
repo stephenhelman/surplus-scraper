@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +21,8 @@ import httpx
 
 from scrapers.registry import REGISTRY, get_scraper
 from enrichment.normalizer import normalize
+from scrapers.marion_pa_lookup import enrich_with_pa_lookup
+from enrichment.enrich_prep import ENRICH_PREP_REGISTRY, run_enrich_prep
 from enrichment.skip_trace import (
     COST_PER_RECORD,
     MAX_ENRICH_PER_RUN,
@@ -53,6 +55,17 @@ class RunRequest(BaseModel):
     callbackUrl: str
 
 
+class EnrichPrepLead(BaseModel):
+    id: str
+    caseNumber: str
+    saleDate: str
+
+
+class EnrichPrepRequest(BaseModel):
+    county: str
+    leads: list[EnrichPrepLead]
+
+
 @app.get("/health")
 async def health():
     batchdata_key = os.getenv("BATCHDATA_API_KEY", "")
@@ -63,6 +76,7 @@ async def health():
     return {
         "status": "ok",
         "supportedCounties": list(REGISTRY.keys()),
+        "enrichPrepCounties": list(ENRICH_PREP_REGISTRY.keys()),
         "config": {
             "skipTraceMinSurplus": skip_trace_min,
             "maxEnrichPerRun": max_enrich,
@@ -90,6 +104,32 @@ async def run_county(
     logger.info("Pipeline started: county=%s callback=%s", county, body.callbackUrl)
     background_tasks.add_task(run_pipeline, county, body.callbackUrl)
     return {"status": "started", "county": county}
+
+
+@app.post("/enrich-prep")
+async def enrich_prep(
+    request: EnrichPrepRequest,
+    x_internal_secret: str = Header(None),
+):
+    if x_internal_secret != SCRAPER_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    if not request.leads:
+        raise HTTPException(status_code=400, detail="No leads provided")
+
+    try:
+        result = await run_enrich_prep(
+            request.county,
+            [lead.dict() for lead in request.leads],
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Enrich prep failed: {str(e)}",
+        )
 
 
 def _callback_headers() -> dict:
@@ -125,6 +165,16 @@ async def run_pipeline(county: str, callback_url: str) -> None:
                     "error": f"No surplus records found for {county}.",
                 })
                 return
+
+            # Marion County: enrich with property appraiser
+            # lookup to get former owner name + mailing address.
+            # lookup_year per record = sale_date.year - 1
+            # (year BEFORE the tax sale) to avoid returning
+            # the auction buyer instead of the former owner.
+            if county == "marion-county-fl":
+                print(f"[pipeline] Running Marion County PA "
+                      f"lookup for {len(clean)} records...")
+                clean = await enrich_with_pa_lookup(clean)
 
             # Phase 2 — pre-enrichment callback
             logger.info("[%s] Phase 2: pre-enrichment callback", county)
